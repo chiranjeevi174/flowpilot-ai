@@ -1,0 +1,111 @@
+# ==============================================================================
+# FlowPilot AI - Infrastructure Composition
+# ==============================================================================
+# Local development and containerized services for FlowPilot AI.
+# Usage:
+#   docker compose -f infrastructure/compose.yaml up -d
+#   docker compose -f infrastructure/compose.yaml --profile workers up -d
+# ==============================================================================
+
+name: flowpilot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: flowpilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flowpilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flowpilot_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-flowpilot}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-test-db.sql:/docker-entrypoint-initdb.d/01-init-test-db.sql:ro
+    ports:
+      # Bound strictly to localhost for security; port 5433 used to prevent conflict with local Postgres instances
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flowpilot} -d ${POSTGRES_DB:-flowpilot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: flowpilot-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    ports:
+      # Bound strictly to localhost for development access; not exposed publicly
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "flowpilot.workers.celery_app", "worker", "--loglevel=info", "-c", "4"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flowpilot}:${POSTGRES_PASSWORD:-flowpilot_dev_password}@postgres:5432/${POSTGRES_DB:-flowpilot}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      LLM_ENCRYPTION_KEYS: ${LLM_ENCRYPTION_KEYS:-k1V9O2gDqG4g3VzZ6X_K5y5uW1qR9nS8lJ4fA0bC2eY=}
+      INTEGRATION_ENCRYPTION_KEYS: ${INTEGRATION_ENCRYPTION_KEYS:-k1V9O2gDqG4g3VzZ6X_K5y5uW1qR9nS8lJ4fA0bC2eY=}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+    profiles:
+      - workers
+
+  beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-beat
+    restart: unless-stopped
+    command: ["celery", "-A", "flowpilot.workers.celery_app", "beat", "--loglevel=info"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-flowpilot}:${POSTGRES_PASSWORD:-flowpilot_dev_password}@postgres:5432/${POSTGRES_DB:-flowpilot}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+    profiles:
+      - workers
+
+networks:
+  flowpilot-network:
+    name: flowpilot_network
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: flowpilot_postgres_data
+  redis_data:
+    name: flowpilot_redis_data

@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+wheels/
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env*.example
+
+# Pytest & Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Celery Beat runtime schedule database
+celerybeat-schedule*
+*.schedule.db

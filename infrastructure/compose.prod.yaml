@@ -1,0 +1,234 @@
+# ==============================================================================
+# FlowPilot AI - Production Infrastructure Composition
+# ==============================================================================
+# Full-stack containerized deployment: Reverse Proxy, Frontend, Backend,
+# Celery Worker, Celery Beat, PostgreSQL, and Redis.
+#
+# Usage:
+#   docker compose -f infrastructure/compose.prod.yaml --env-file infrastructure/.env.prod up -d --build
+# ==============================================================================
+
+name: flowpilot-prod
+
+services:
+  # ----------------------------------------------------------------------------
+  # Reverse Proxy (NGINX)
+  # ----------------------------------------------------------------------------
+  proxy:
+    image: nginx:1.25-alpine
+    container_name: flowpilot-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+
+  # ----------------------------------------------------------------------------
+  # Next.js Frontend (BFF + React App)
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: flowpilot-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      BACKEND_API_URL: http://backend:8000
+      NEXT_PUBLIC_APP_URL: ${APP_URL:-http://localhost}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/login || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ----------------------------------------------------------------------------
+  # Database Migration Runner (One-Shot)
+  # ----------------------------------------------------------------------------
+  migrator:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-migrator
+    restart: "no"
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ENVIRONMENT: production
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      LLM_ENCRYPTION_KEYS: ${LLM_ENCRYPTION_KEYS}
+      INTEGRATION_ENCRYPTION_KEYS: ${INTEGRATION_ENCRYPTION_KEYS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+
+  # ----------------------------------------------------------------------------
+  # FastAPI Application Backend
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-backend
+    restart: unless-stopped
+    command: ["python", "-m", "uvicorn", "flowpilot.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: "INFO"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      LLM_ENCRYPTION_KEYS: ${LLM_ENCRYPTION_KEYS}
+      INTEGRATION_ENCRYPTION_KEYS: ${INTEGRATION_ENCRYPTION_KEYS}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost","http://localhost:3000"]}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost/api/v1/integrations/google/callback}
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      SLACK_REDIRECT_URI: ${SLACK_REDIRECT_URI:-http://localhost/api/v1/integrations/slack/callback}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/api/v1/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ----------------------------------------------------------------------------
+  # Celery Background Worker
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-worker-prod
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "flowpilot.workers.celery_app", "worker", "--loglevel=info", "-c", "4"]
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      LLM_ENCRYPTION_KEYS: ${LLM_ENCRYPTION_KEYS}
+      INTEGRATION_ENCRYPTION_KEYS: ${INTEGRATION_ENCRYPTION_KEYS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+    healthcheck:
+      disable: true
+
+  # ----------------------------------------------------------------------------
+  # Celery Beat Scheduler
+  # ----------------------------------------------------------------------------
+  beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: flowpilot-beat-prod
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "flowpilot.workers.celery_app", "beat", "--loglevel=info"]
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - flowpilot-network
+    healthcheck:
+      disable: true
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL 16 (Not exposed publicly)
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: flowpilot-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ----------------------------------------------------------------------------
+  # Redis 7 (Not exposed publicly)
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: flowpilot-redis-prod
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_prod_data:/data
+    networks:
+      - flowpilot-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+networks:
+  flowpilot-network:
+    name: flowpilot_prod_network
+    driver: bridge
+
+volumes:
+  postgres_prod_data:
+    name: flowpilot_postgres_prod_data
+  redis_prod_data:
+    name: flowpilot_redis_prod_data
