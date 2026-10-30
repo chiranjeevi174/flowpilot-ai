@@ -17,8 +17,13 @@ function validateFile(readmePath, baseDir) {
   return allOk;
 }
 
-const rootOk = validateFile('D:/PROJECTS/FLOWPILOT-AI/README.md', 'D:/PROJECTS/FLOWPILOT-AI');
-const feOk = validateFile('D:/PROJECTS/FLOWPILOT-AI/frontend/README.md', 'D:/PROJECTS/FLOWPILOT-AI/frontend');
+const projectRoot = path.resolve(__dirname, '..');
+const rootReadme = path.join(projectRoot, 'README.md');
+const frontendReadme = path.join(projectRoot, 'frontend', 'README.md');
+const frontendDir = path.join(projectRoot, 'frontend');
+
+const rootOk = validateFile(rootReadme, projectRoot);
+const feOk = validateFile(frontendReadme, frontendDir);
 
 if (rootOk && feOk) {
   console.log('\nSUCCESS: ALL REFERENCED IMAGES EXIST AND RESOLVE CORRECTLY!');
