@@ -544,10 +544,6 @@ class IntegrationService:
         whatsapp_conns = [c for c in user_conns if c.provider == "whatsapp"]
 
         # Default or primary connection per provider
-        google_conn = next(
-            (c for c in google_conns if c.is_default),
-            google_conns[0] if google_conns else None,
-        )
         slack_conn = next(
             (c for c in slack_conns if c.is_default),
             slack_conns[0] if slack_conns else None,
@@ -557,7 +553,49 @@ class IntegrationService:
             whatsapp_conns[0] if whatsapp_conns else None,
         )
 
-        def resolve_status(conn: IntegrationConnection | None, provider_id: str) -> str:
+        # Gmail connection resolution:
+        # Match service == "gmail", scopes with mail/gmail, or default google connection
+        default_google = next((c for c in google_conns if c.is_default), None)
+        first_google = google_conns[0] if google_conns else None
+
+        gmail_conn = (
+            next((c for c in google_conns if c.service == "gmail"), None)
+            or next(
+                (
+                    c
+                    for c in google_conns
+                    if any("mail" in s.lower() for s in (c.granted_scopes or []))
+                ),
+                None,
+            )
+            or default_google
+            or first_google
+        )
+
+        # Google Sheets connection resolution:
+        # Match service == "sheets", scopes with spreadsheets, or connection with spreadsheets scope
+        has_sheets_scope = lambda c: any(  # noqa: E731
+            "spreadsheets" in s.lower() for s in (c.granted_scopes or [])
+        )
+        sheets_conn = (
+            next((c for c in google_conns if c.service == "sheets"), None)
+            or next((c for c in google_conns if has_sheets_scope(c)), None)
+            or next(
+                (
+                    c
+                    for c in google_conns
+                    if c.is_default
+                    and (not c.service or c.service == "sheets" or has_sheets_scope(c))
+                ),
+                first_google if first_google and has_sheets_scope(first_google) else None,
+            )
+        )
+
+        def resolve_status(
+            conn: IntegrationConnection | None,
+            provider_id: str,
+            required_scope: str | None = None,
+        ) -> str:
             if not conn:
                 return "not_configured"
             if conn.status == ConnectionStatus.ERROR:
@@ -590,6 +628,13 @@ class IntegrationService:
                 if conn.client_id or conn.encrypted_client_secret:
                     return "credentials_saved"
                 return "configuration_incomplete"
+
+            # Check required scope for google sub-services if granted_scopes are recorded
+            if required_scope and conn.granted_scopes:
+                has_scope = any(required_scope.lower() in s.lower() for s in conn.granted_scopes)
+                if not has_scope:
+                    return "authorization_required"
+
             return "connected"
 
         def client_preview(client_id: str | None) -> str | None:
@@ -600,8 +645,7 @@ class IntegrationService:
             return f"{client_id[:6]}...{client_id[-4:]}"
 
         # 1. Gmail
-        gmail_conn = google_conn
-        gmail_status = resolve_status(gmail_conn, "google")
+        gmail_status = resolve_status(gmail_conn, "google", "gmail.send")
         gmail_item = AppConnectionOverviewItem(
             id="gmail",
             name="Gmail",
@@ -638,8 +682,7 @@ class IntegrationService:
         )
 
         # 2. Google Sheets
-        sheets_conn = google_conn
-        sheets_status = resolve_status(sheets_conn, "google")
+        sheets_status = resolve_status(sheets_conn, "google", "spreadsheets")
         sheets_item = AppConnectionOverviewItem(
             id="sheets",
             name="Google Sheets",
@@ -1132,7 +1175,13 @@ class IntegrationService:
             target_connection.encrypted_access_token = encrypted_access
             if encrypted_refresh:
                 target_connection.encrypted_refresh_token = encrypted_refresh
-            target_connection.granted_scopes = bundle.granted_scopes
+            # Merge previously granted scopes with newly granted scopes from Google
+            merged_scopes = list(
+                dict.fromkeys(
+                    (target_connection.granted_scopes or []) + (bundle.granted_scopes or [])
+                )
+            )
+            target_connection.granted_scopes = merged_scopes
             target_connection.token_expires_at = bundle.expires_at
             target_connection.status = ConnectionStatus.ACTIVE
             target_connection.last_verified_at = now
@@ -1163,7 +1212,11 @@ class IntegrationService:
             existing.encrypted_access_token = encrypted_access
             if encrypted_refresh:
                 existing.encrypted_refresh_token = encrypted_refresh
-            existing.granted_scopes = bundle.granted_scopes
+            # Merge previously granted scopes with newly granted scopes from Google
+            merged_scopes = list(
+                dict.fromkeys((existing.granted_scopes or []) + (bundle.granted_scopes or []))
+            )
+            existing.granted_scopes = merged_scopes
             existing.token_expires_at = bundle.expires_at
             existing.external_account_name = (
                 bundle.external_account_name or existing.external_account_name
@@ -1282,18 +1335,68 @@ class IntegrationService:
                     if resp.status_code != 200:
                         raise OAuthError(f"Google userinfo check returned {resp.status_code}")
                     userinfo = resp.json()
-                    connection.last_verified_at = now
-                    connection.status = ConnectionStatus.ACTIVE
-                    await db.commit()
-                    return IntegrationConnectionTestResponse(
-                        id=connection.id,
-                        ok=True,
-                        provider="google",
-                        status="active",
-                        message="Google authentication and API reachability verified successfully.",
-                        external_account_id=userinfo.get("email") or connection.external_account_id,
-                        tested_at=now,
+
+                # Verify service-specific required scopes
+                if connection.service == "gmail":
+                    has_gmail_send = any(
+                        "gmail.send" in s.lower() for s in (connection.granted_scopes or [])
                     )
+                    if not has_gmail_send:
+                        connection.last_verified_at = now
+                        connection.status = ConnectionStatus.AUTHORIZATION_REQUIRED
+                        await db.commit()
+                        return IntegrationConnectionTestResponse(
+                            id=connection.id,
+                            ok=False,
+                            provider="google",
+                            status="authorization_required",
+                            message=(
+                                "Google account is connected, but missing required Gmail "
+                                "sending permission (https://www.googleapis.com/auth/gmail.send). "
+                                "Reauthorization required."
+                            ),
+                            external_account_id=(
+                                userinfo.get("email") or connection.external_account_id
+                            ),
+                            tested_at=now,
+                        )
+
+                if connection.service == "sheets":
+                    has_sheets = any(
+                        "spreadsheets" in s.lower() for s in (connection.granted_scopes or [])
+                    )
+                    if not has_sheets:
+                        connection.last_verified_at = now
+                        connection.status = ConnectionStatus.AUTHORIZATION_REQUIRED
+                        await db.commit()
+                        return IntegrationConnectionTestResponse(
+                            id=connection.id,
+                            ok=False,
+                            provider="google",
+                            status="authorization_required",
+                            message=(
+                                "Google account is connected, but missing required Google Sheets "
+                                "permission (https://www.googleapis.com/auth/spreadsheets). "
+                                "Reauthorization required."
+                            ),
+                            external_account_id=(
+                                userinfo.get("email") or connection.external_account_id
+                            ),
+                            tested_at=now,
+                        )
+
+                connection.last_verified_at = now
+                connection.status = ConnectionStatus.ACTIVE
+                await db.commit()
+                return IntegrationConnectionTestResponse(
+                    id=connection.id,
+                    ok=True,
+                    provider="google",
+                    status="active",
+                    message="Google authentication and API reachability verified successfully.",
+                    external_account_id=userinfo.get("email") or connection.external_account_id,
+                    tested_at=now,
+                )
 
             elif connection.provider == "slack":
                 from slack_sdk.web.async_client import AsyncWebClient

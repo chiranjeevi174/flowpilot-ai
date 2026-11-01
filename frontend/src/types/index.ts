@@ -157,11 +157,24 @@ export interface IntegrationConnection {
   user_id: string;
   provider: string;
   service: string | null;
+  config_method?: string;
+  client_id?: string | null;
+  has_client_secret?: boolean;
+  has_access_token?: boolean;
+  is_default?: boolean;
   external_account_id: string | null;
   external_account_name: string | null;
   granted_scopes: string[];
   token_expires_at: string | null;
-  status: "active" | "expired" | "revoked" | "error";
+  status:
+    | "active"
+    | "expired"
+    | "revoked"
+    | "error"
+    | "configured"
+    | "authorization_required"
+    | "restricted"
+    | string;
   last_verified_at: string | null;
   metadata_json: Record<string, any>;
   created_at: string;

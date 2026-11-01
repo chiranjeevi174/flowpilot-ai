@@ -37,6 +37,14 @@ async def execute_plan_node(
 
     session_maker = async_session_factory()
     async with session_maker() as db:
+        from flowpilot.agents.resolution import resolve_step_placeholders
+        from flowpilot.integrations.security import compute_parameter_digest
+        from flowpilot.models.user import User
+        from flowpilot.workflows.tools import is_operation_sensitive
+
+        user_record = await db.get(User, user_id)
+        user_email = user_record.email if user_record else None
+
         for step in execution_plan:
             step_id = step.get("step_id")
             operation = step.get("operation", "")
@@ -45,6 +53,19 @@ async def execute_plan_node(
             if step_id in executed_step_ids:
                 logger.debug("Skipping already executed step '%s' [run_id=%s]", step_id, run_id)
                 continue
+
+            # Sensitivity check: If step mandates approval and has not been approved, halt execution
+            is_sensitive = step.get("approval_required") or is_operation_sensitive(
+                operation, step.get("parameters")
+            )
+            if is_sensitive and state.get("approval_status") != "approved":
+                logger.info(
+                    "Halting execution before sensitive step '%s' (%s) [run_id=%s]",
+                    step_id,
+                    operation,
+                    run_id,
+                )
+                break
 
             handler = get_tool_handler(operation)
             if handler is None:
@@ -66,7 +87,15 @@ async def execute_plan_node(
                 }
 
             logger.info("Executing step '%s' (%s) [run_id=%s]", step_id, operation, run_id)
+
+            # Resolve placeholders and propagate context/outputs from preceding steps
             parameters = dict(step.get("parameters") or {})
+            parameters = resolve_step_placeholders(
+                parameters=parameters,
+                step_results=step_results,
+                user_email=user_email,
+                operation=operation,
+            )
 
             # Feed forward context or prior step outputs if available
             if step_results and not parameters.get("previous_results"):
@@ -75,14 +104,24 @@ async def execute_plan_node(
             # Bind run_id, step_id, and approval decision for external audit and idempotency
             parameters["run_id"] = str(run_id)
             parameters["step_id"] = str(step_id)
-            if state.get("approval_status") == "approved":
-                from flowpilot.integrations.security import compute_parameter_digest
-
+            if state.get("approval_status") == "approved" and is_sensitive:
+                material_params = {
+                    k: v
+                    for k, v in parameters.items()
+                    if k
+                    not in (
+                        "approved",
+                        "approval_parameter_digest",
+                        "approval_reference",
+                        "step_id",
+                        "idempotency_key",
+                        "run_id",
+                        "previous_results",
+                    )
+                }
                 parameters["approved"] = True
                 parameters["approval_reference"] = "approved_by_user"
-                parameters["approval_parameter_digest"] = compute_parameter_digest(
-                    dict(step.get("parameters") or {})
-                )
+                parameters["approval_parameter_digest"] = compute_parameter_digest(material_params)
 
             try:
                 outcome = await handler(

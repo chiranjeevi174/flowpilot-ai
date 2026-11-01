@@ -25,55 +25,151 @@ async def approval_gate_node(
     execution_plan = state.get("execution_plan") or []
     current_approval_status = state.get("approval_status", "pending")
 
-    # If already decided in previous turn (e.g., during resume replay), respect it
-    if current_approval_status in ("approved", "rejected", "not_required"):
-        logger.info(
-            "Approval gate skipped; already in state '%s' [run_id=%s]",
-            current_approval_status,
-            run_id,
-        )
-        return {
-            "approval_status": current_approval_status,
-        }
+    executed_step_ids = set(state.get("executed_step_ids") or [])
+    unexecuted_steps = [s for s in execution_plan if s.get("step_id") not in executed_step_ids]
 
-    # Find the first step that requires approval (either per plan or backend policy)
-    sensitive_step: dict[str, Any] | None = None
-    for step in execution_plan:
-        if step.get("approval_required") or is_operation_sensitive(
-            step.get("operation", ""), step.get("parameters")
-        ):
-            sensitive_step = step
-            break
-
-    # If no step requires approval, proceed directly
-    if not sensitive_step:
-        logger.info("No sensitive operations found in plan [run_id=%s]", run_id)
+    # If all planned operations have already executed, no approval is needed
+    if not unexecuted_steps:
+        logger.info("No unexecuted operations remaining in plan [run_id=%s]", run_id)
         return {
             "approval_status": "not_required",
             "execution_status": "running",
         }
 
-    from flowpilot.integrations.security import compute_parameter_digest
+    # Identify the next step to execute
+    next_step = unexecuted_steps[0]
+    next_is_sensitive = next_step.get("approval_required") or is_operation_sensitive(
+        next_step.get("operation", ""), next_step.get("parameters")
+    )
 
-    step_params = dict(sensitive_step.get("parameters") or {})
+    # If the upcoming step is not sensitive, proceed directly to executor
+    if not next_is_sensitive:
+        logger.info(
+            "Next operation '%s' (%s) is not sensitive; proceeding to execution [run_id=%s]",
+            next_step.get("step_id"),
+            next_step.get("operation"),
+            run_id,
+        )
+        return {
+            "approval_status": "not_required",
+            "execution_status": "running",
+        }
+
+    # If the sensitive step was already approved or rejected in a previous turn
+    if current_approval_status == "approved":
+        return {
+            "approval_status": "approved",
+            "execution_status": "running",
+        }
+    if current_approval_status == "rejected":
+        return {
+            "approval_status": "rejected",
+            "execution_status": "rejected",
+        }
+
+    # The upcoming step requires human approval.
+    # Preceding non-sensitive steps have already succeeded; resolve any placeholders
+    # (e.g. output_from_step_X) and missing fields using real execution outputs:
+    from flowpilot.agents.resolution import resolve_step_placeholders
+    from flowpilot.integrations.security import compute_parameter_digest
+    from flowpilot.models.user import User
+
+    user_uuid = uuid.UUID(state["user_id"])
+    session_maker = async_session_factory()
+    user_email = None
+    async with session_maker() as db:
+        user_record = await db.get(User, user_uuid)
+        if user_record:
+            user_email = user_record.email
+
+    step_params = resolve_step_placeholders(
+        parameters=dict(next_step.get("parameters") or {}),
+        step_results=state.get("step_results") or [],
+        user_email=user_email,
+        operation=next_step.get("operation", ""),
+    )
+
+    # Ensure proposed email body is strictly verified against numerical inaccuracies & currency
+    if step_params.get("body") and isinstance(step_params["body"], str):
+        from flowpilot.agents.analysis import (
+            TabularAnalysis,
+            clean_numerical_contradictions,
+            find_numerical_contradictions,
+            rectify_text_numbers,
+            validate_summary_accuracy,
+        )
+
+        # Build active analysis from preceding step results if available
+        active_analysis = None
+        for r in state.get("step_results") or []:
+            res = r.get("result") or {}
+            if (
+                isinstance(res, dict)
+                and "rows" in res
+                and isinstance(res["rows"], list)
+                and res["rows"]
+            ):
+                from flowpilot.agents.analysis import analyze_tabular_dataset
+
+                active_analysis = analyze_tabular_dataset(
+                    res["rows"], sheet_title=res.get("range", "Dataset")
+                )
+                break
+
+        if active_analysis is None:
+            active_analysis = TabularAnalysis(
+                sheet_title="Dataset",
+                total_rows_retrieved=0,
+                data_row_count=0,
+                is_truncated=False,
+                headers=[],
+                columns={},
+                currency_detected=None,
+                currency_note="No currency established.",
+                date_range_note="",
+            )
+
+        step_params["body"] = rectify_text_numbers(step_params["body"], active_analysis)
+
+        # Strict safety invariant: contradictory statements cannot reach the approval gate
+        contradictions = find_numerical_contradictions(step_params["body"], active_analysis)
+        if contradictions:
+            logger.warning(
+                "Contradictory numerical claims detected before approval gate: %s", contradictions
+            )
+            step_params["body"] = clean_numerical_contradictions(
+                step_params["body"], active_analysis
+            )
+
+        # Pre-send validation: ensure no unresolved errors remain before gate
+        val_errors = validate_summary_accuracy(step_params["body"], active_analysis)
+        if val_errors:
+            logger.warning("Pre-approval validation detected issues: %s", val_errors)
+            step_params["body"] = rectify_text_numbers(step_params["body"], active_analysis)
+
+    # Update next_step parameters in execution_plan so state and digests stay in sync
+    next_step["parameters"] = step_params
+
     param_digest = compute_parameter_digest(step_params)
 
     # Prepare interrupt payload describing proposed action to reviewer
     approval_payload = {
         "run_id": run_id,
-        "step_id": sensitive_step.get("step_id"),
-        "operation": sensitive_step.get("operation"),
+        "step_id": next_step.get("step_id"),
+        "operation": next_step.get("operation"),
         "parameters": step_params,
         "parameter_digest": param_digest,
-        "expected_outcome": sensitive_step.get("expected_outcome", ""),
+        "expected_outcome": next_step.get("expected_outcome", ""),
         "message": (
-            f"Operation '{sensitive_step.get('operation')}' is classified as sensitive and "
+            f"Operation '{next_step.get('operation')}' is classified as sensitive and "
             "requires human authorization before execution."
         ),
+        "recipient": step_params.get("recipient") or step_params.get("to"),
+        "subject": step_params.get("subject"),
+        "body": step_params.get("body"),
     }
 
     # Update database state to awaiting_approval and log audit event before pausing
-    session_maker = async_session_factory()
     async with session_maker() as db:
         run_uuid = uuid.UUID(run_id)
         result = await db.execute(select(AgentRun).where(AgentRun.id == run_uuid))
@@ -86,7 +182,7 @@ async def approval_gate_node(
                 from flowpilot.models.notification import NotificationType
                 from flowpilot.services.notifications import NotificationService
 
-                op_label = sensitive_step.get("operation", "action")
+                op_label = next_step.get("operation", "action")
                 await NotificationService.create_or_update_notification(
                     db=db,
                     user_id=agent_run.user_id,
@@ -95,13 +191,13 @@ async def approval_gate_node(
                     message=(
                         f"Workflow execution is waiting for authorization to execute {op_label}."
                     ),
-                    dedup_key=f"approval_requested_{run_id}_{sensitive_step.get('step_id')}",
+                    dedup_key=f"approval_requested_{run_id}_{next_step.get('step_id')}",
                     category="approval",
                     link_url=f"/approvals?run_id={run_id}",
                     meta_data={
                         "run_id": str(run_id),
-                        "operation": sensitive_step.get("operation"),
-                        "step_id": sensitive_step.get("step_id"),
+                        "operation": next_step.get("operation"),
+                        "step_id": next_step.get("step_id"),
                         "parameters": step_params,
                     },
                 )
@@ -118,7 +214,7 @@ async def approval_gate_node(
 
     logger.info(
         "Pausing execution for human approval on step '%s' [run_id=%s]",
-        sensitive_step.get("step_id"),
+        next_step.get("step_id"),
         run_id,
     )
 
@@ -147,7 +243,7 @@ async def approval_gate_node(
             logger.warning("Failed to resolve approval notification: %s", notif_err)
 
         if decision == "approve":
-            current_step_params = dict(sensitive_step.get("parameters") or {})
+            current_step_params = dict(next_step.get("parameters") or {})
             if compute_parameter_digest(current_step_params) != param_digest:
                 logger.error(
                     "Security violation: step parameters modified post-approval! [run_id=%s]",
@@ -163,14 +259,15 @@ async def approval_gate_node(
                 agent_name="approval_gate",
                 event_type="approval_granted",
                 event_payload={
-                    "step_id": sensitive_step.get("step_id"),
-                    "operation": sensitive_step.get("operation"),
+                    "step_id": next_step.get("step_id"),
+                    "operation": next_step.get("operation"),
                     "comment": comment,
                 },
             )
             return {
                 "approval_status": "approved",
                 "execution_status": "running",
+                "execution_plan": execution_plan,
             }
         else:
             await record_event(
@@ -179,8 +276,8 @@ async def approval_gate_node(
                 agent_name="approval_gate",
                 event_type="approval_rejected",
                 event_payload={
-                    "step_id": sensitive_step.get("step_id"),
-                    "operation": sensitive_step.get("operation"),
+                    "step_id": next_step.get("step_id"),
+                    "operation": next_step.get("operation"),
                     "comment": comment,
                 },
             )
@@ -196,6 +293,6 @@ async def approval_gate_node(
                 "final_response": {
                     "status": "rejected",
                     "reason": rejection_reason,
-                    "rejected_step": sensitive_step,
+                    "rejected_step": next_step,
                 },
             }

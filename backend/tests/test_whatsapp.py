@@ -472,7 +472,7 @@ async def test_webhook_delivery_failure_updates_action_status(
         idempotency_key=f"test_fail_idemp_{uuid.uuid4()}",
         status=ExternalActionStatus.SUCCEEDED,
         provider_action_id=target_wamid,
-        provider_response={"status": "accepted", "recipient": "919398560017"},
+        provider_response={"status": "accepted", "recipient": "919876543210"},
     )
     db_session.add(action)
     await db_session.commit()
@@ -481,7 +481,7 @@ async def test_webhook_delivery_failure_updates_action_status(
         "object": "whatsapp_business_account",
         "entry": [
             {
-                "id": "1591437232188931",
+                "id": "100000000000001",
                 "changes": [
                     {
                         "value": {
@@ -495,7 +495,7 @@ async def test_webhook_delivery_failure_updates_action_status(
                                     "id": target_wamid,
                                     "status": "failed",
                                     "timestamp": "1730006000",
-                                    "recipient_id": "919398560017",
+                                    "recipient_id": "919876543210",
                                     "errors": [
                                         {
                                             "code": 131030,
@@ -563,13 +563,13 @@ async def test_whatsapp_subscribe_waba_to_app():
     with patch("httpx.AsyncClient.post") as mock_post:
         mock_post.return_value = Response(200, json={"success": True})
         res = await WhatsAppClient.subscribe_waba_to_app(
-            waba_id="1591437232188931",
+            waba_id="100000000000001",
             access_token=TEST_TOKEN,
         )
         assert res.get("success") is True
         mock_post.assert_called_once()
         call_url = mock_post.call_args[0][0]
-        assert "1591437232188931/subscribed_apps" in call_url
+        assert "100000000000001/subscribed_apps" in call_url
 
 
 # ==============================================================================

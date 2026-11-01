@@ -5,12 +5,10 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  AlertCircle,
   AlertTriangle,
   ArrowRight,
   BookOpen,
   Check,
-  CheckCircle2,
   Clock,
   Copy,
   ExternalLink,
@@ -20,7 +18,6 @@ import {
   Info,
   KeyRound,
   Layers,
-  Lock,
   Mail,
   MessageCircle,
   MessageSquare,
@@ -29,14 +26,14 @@ import {
   Save,
   ShieldCheck,
   Trash2,
-  Unplug,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api/client";
+import { invalidateAllIntegrationQueries } from "@/lib/integrations-status";
+import { IntegrationStatusBadge } from "@/components/shared/integration-status-badge";
 import type {
   AppConnectionOverviewItem,
-  AppConnectionStatus,
   SaveCustomCredentialsRequest,
 } from "@/types";
 import { PageHeader } from "@/components/shared/page-header";
@@ -53,69 +50,6 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
-
-// Status configuration map for badges
-const STATUS_CONFIG: Record<
-  AppConnectionStatus,
-  { label: string; bg: string; text: string; border: string; icon: React.ComponentType<{ className?: string }> }
-> = {
-  connected: {
-    label: "Connected",
-    bg: "bg-emerald-500/10 dark:bg-emerald-500/20",
-    text: "text-emerald-700 dark:text-emerald-400",
-    border: "border-emerald-500/20",
-    icon: CheckCircle2,
-  },
-  credentials_saved: {
-    label: "Credentials Saved",
-    bg: "bg-teal-500/10 dark:bg-teal-500/20",
-    text: "text-teal-700 dark:text-teal-400",
-    border: "border-teal-500/20",
-    icon: ShieldCheck,
-  },
-  authorization_required: {
-    label: "Authorization Required",
-    bg: "bg-blue-500/10 dark:bg-blue-500/20",
-    text: "text-blue-700 dark:text-blue-400",
-    border: "border-blue-500/20",
-    icon: KeyRound,
-  },
-  configuration_incomplete: {
-    label: "Configuration Incomplete",
-    bg: "bg-amber-500/10 dark:bg-amber-500/20",
-    text: "text-amber-700 dark:text-amber-400",
-    border: "border-amber-500/20",
-    icon: AlertTriangle,
-  },
-  not_configured: {
-    label: "Not Configured",
-    bg: "bg-slate-500/10 dark:bg-slate-500/20",
-    text: "text-slate-600 dark:text-slate-400",
-    border: "border-slate-500/20",
-    icon: Unplug,
-  },
-  token_expired: {
-    label: "Token Expired",
-    bg: "bg-rose-500/10 dark:bg-rose-500/20",
-    text: "text-rose-700 dark:text-rose-400",
-    border: "border-rose-500/20",
-    icon: AlertCircle,
-  },
-  error: {
-    label: "Connection Error",
-    bg: "bg-red-500/10 dark:bg-red-500/20",
-    text: "text-red-700 dark:text-red-400",
-    border: "border-red-500/20",
-    icon: AlertCircle,
-  },
-  restricted: {
-    label: "Restricted by Provider",
-    bg: "bg-purple-500/10 dark:bg-purple-500/20",
-    text: "text-purple-700 dark:text-purple-400",
-    border: "border-purple-500/20",
-    icon: Lock,
-  },
-};
 
 function formatLastUpdated(dateStr?: string | null): string | null {
   if (!dateStr) return null;
@@ -175,7 +109,7 @@ export default function AppConnectionsPage() {
       toast.success(`Successfully connected ${provider.toUpperCase()}`, {
         description: "Your integration authorization has been verified and securely saved.",
       });
-      queryClient.invalidateQueries({ queryKey: ["app-connections-overview"] });
+      invalidateAllIntegrationQueries(queryClient);
     }
   }, [searchParams, queryClient]);
 
@@ -246,7 +180,7 @@ export default function AppConnectionsPage() {
             ? "WhatsApp sender tested and verified."
             : "Credentials encrypted. You can now complete authorization.",
       });
-      queryClient.invalidateQueries({ queryKey: ["app-connections-overview"] });
+      invalidateAllIntegrationQueries(queryClient);
 
       // Reset replacing states
       setIsReplacingSecret(false);
@@ -285,12 +219,13 @@ export default function AppConnectionsPage() {
           description: data.message || "Could not reach external provider API.",
         });
       }
-      queryClient.invalidateQueries({ queryKey: ["app-connections-overview"] });
+      invalidateAllIntegrationQueries(queryClient);
     },
     onError: (err: any) => {
       toast.error("Connection test error", {
         description: err.message || "Error running connectivity probe.",
       });
+      invalidateAllIntegrationQueries(queryClient);
     },
   });
 
@@ -305,7 +240,7 @@ export default function AppConnectionsPage() {
       });
       setDisconnectTarget(null);
       setSelectedProvider(null);
-      queryClient.invalidateQueries({ queryKey: ["app-connections-overview"] });
+      invalidateAllIntegrationQueries(queryClient);
     },
     onError: (err: any) => {
       toast.error("Failed to disconnect", {
@@ -472,7 +407,10 @@ export default function AppConnectionsPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => refetch()}
+            onClick={() => {
+              refetch();
+              invalidateAllIntegrationQueries(queryClient);
+            }}
             disabled={isRefetching}
             className="border-[#E2E8E7]"
           >
@@ -520,61 +458,65 @@ export default function AppConnectionsPage() {
               </Card>
             ))
           : overview.map((item) => {
-              const statusCfg = STATUS_CONFIG[item.status as AppConnectionStatus] || STATUS_CONFIG.not_configured;
-              const StatusIcon = statusCfg.icon;
-
               return (
                 <Card
                   key={item.id}
                   className="bg-[#FFFFFF] border-[#E2E8E7] shadow-xs hover:border-[#087F72]/40 transition-all flex flex-col justify-between"
                 >
-                  <CardHeader className="pb-3.5">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={`h-11 w-11 rounded-lg flex items-center justify-center shrink-0 border ${
-                            item.id === "gmail"
-                              ? "bg-red-50 text-red-600 border-red-200"
-                              : item.id === "sheets"
-                              ? "bg-emerald-50 text-emerald-600 border-emerald-200"
-                              : item.id === "slack"
-                              ? "bg-purple-50 text-purple-600 border-purple-200"
-                              : "bg-teal-50 text-teal-600 border-teal-200"
-                          }`}
-                        >
-                          {item.id === "gmail" && <Mail className="h-5 w-5" />}
-                          {item.id === "sheets" && <FileSpreadsheet className="h-5 w-5" />}
-                          {item.id === "slack" && <MessageSquare className="h-5 w-5" />}
-                          {item.id === "whatsapp" && <MessageCircle className="h-5 w-5" />}
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <CardTitle className="text-base font-bold text-[#202B33]">
-                              {item.name}
-                            </CardTitle>
-                            {item.is_default && item.connection_id && (
-                              <Badge variant="outline" className="text-[10px] bg-slate-100 text-slate-700 border-slate-300">
-                                Default
-                              </Badge>
-                            )}
-                          </div>
-                          <span className="text-[11px] text-[#64748B] font-medium block">
-                            {item.category}
-                          </span>
-                        </div>
+                  <CardHeader className="pb-3.5 space-y-3">
+                    {/* Row 1: Provider Icon on left, Status Badge on right */}
+                    <div className="flex items-center justify-between gap-2.5 min-w-0">
+                      <div
+                        className={`h-11 w-11 rounded-lg flex items-center justify-center shrink-0 border ${
+                          item.id === "gmail"
+                            ? "bg-red-50 text-red-600 border-red-200"
+                            : item.id === "sheets"
+                            ? "bg-emerald-50 text-emerald-600 border-emerald-200"
+                            : item.id === "slack"
+                            ? "bg-purple-50 text-purple-600 border-purple-200"
+                            : "bg-teal-50 text-teal-600 border-teal-200"
+                        }`}
+                      >
+                        {item.id === "gmail" && <Mail className="h-5 w-5" />}
+                        {item.id === "sheets" && <FileSpreadsheet className="h-5 w-5" />}
+                        {item.id === "slack" && <MessageSquare className="h-5 w-5" />}
+                        {item.id === "whatsapp" && <MessageCircle className="h-5 w-5" />}
                       </div>
 
                       {/* Status Badge */}
-                      <Badge
-                        variant="outline"
-                        className={`text-xs px-2.5 py-0.5 font-medium flex items-center gap-1.5 ${statusCfg.bg} ${statusCfg.text} ${statusCfg.border}`}
-                      >
-                        <StatusIcon className="h-3 w-3" />
-                        {statusCfg.label}
-                      </Badge>
+                      <div className="shrink-0 flex items-center justify-end">
+                        <IntegrationStatusBadge
+                          status={item.status}
+                          isVerifying={
+                            testMutation.isPending &&
+                            (testMutation.variables as any) === item.connection_id
+                          }
+                        />
+                      </div>
                     </div>
 
-                    <CardDescription className="text-xs text-[#64748B] pt-2 line-clamp-2">
+                    {/* Row 2: Title with Default badge, and Category */}
+                    <div className="space-y-0.5 min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <CardTitle className="text-base font-bold text-[#202B33] truncate">
+                          {item.name}
+                        </CardTitle>
+                        {item.is_default && item.connection_id && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] bg-slate-100 text-slate-700 border-slate-300 shrink-0"
+                          >
+                            Default
+                          </Badge>
+                        )}
+                      </div>
+                      <span className="text-[11px] text-[#64748B] font-medium block truncate">
+                        {item.category}
+                      </span>
+                    </div>
+
+                    {/* Row 3: Description with relaxed leading */}
+                    <CardDescription className="text-xs text-[#64748B] leading-relaxed line-clamp-2">
                       {item.description}
                     </CardDescription>
                   </CardHeader>

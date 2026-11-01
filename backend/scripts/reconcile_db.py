@@ -14,6 +14,7 @@ from sqlalchemy import select
 from flowpilot.db.session import async_session_factory
 from flowpilot.models.agent_event import AgentEvent
 from flowpilot.models.agent_run import AgentRun, AgentRunStatus
+from flowpilot.models.external_action import ExternalAction, ExternalActionStatus
 from flowpilot.models.scheduled_workflow import ScheduleType, ScheduledWorkflow
 from flowpilot.models.user import User
 
@@ -94,11 +95,52 @@ async def reconcile(apply_changes: bool = False) -> None:
                 status_label = "Active (Upcoming)" if s.is_active and not s.last_run_at else "Historical (Executed)"
                 print(f"[VALID SCHEDULE] Schedule ID: {s.id} ('{s.name}') - Type: {s.schedule_type} - {status_label}")
 
-        print("\n--- Summary ---")
-        print(f"Inconsistent runs found: {len(runs_to_reconcile)}")
-        print(f"Inconsistent schedules found: {len(schedules_to_reconcile)}")
+        # 3. Inspect Failed Runs with Succeeded External Actions (Post-Send Verification Failure)
+        failed_runs_stmt = select(AgentRun).where(
+            AgentRun.status == AgentRunStatus.FAILED
+        )
+        failed_runs = (await session.execute(failed_runs_stmt)).scalars().all()
 
-        if not runs_to_reconcile and not schedules_to_reconcile:
+        dispatched_runs_to_reconcile: list[tuple[AgentRun, ExternalAction, str]] = []
+        for fr in failed_runs:
+            user = await session.get(User, fr.user_id)
+            user_email = user.email if user else str(fr.user_id)
+
+            # Check if there is a successful external action linked to this run
+            ea_stmt = (
+                select(ExternalAction)
+                .where(
+                    ExternalAction.run_id == fr.id,
+                    ExternalAction.status == ExternalActionStatus.SUCCEEDED,
+                )
+                .order_by(ExternalAction.created_at.desc())
+            )
+            ea_result = await session.execute(ea_stmt)
+            succeeded_actions = ea_result.scalars().all()
+
+            if succeeded_actions:
+                primary_action = succeeded_actions[0]
+                reason = (
+                    f"Run was marked failed by internal post-send verification "
+                    f"('{fr.error_message}'), but external dispatch operation "
+                    f"'{primary_action.operation}' succeeded and was accepted by provider "
+                    f"(Message ID: {primary_action.provider_action_id})."
+                )
+                dispatched_runs_to_reconcile.append((fr, primary_action, reason))
+                print(f"\n[POST-SEND VERIFICATION FAILURE RUN] Run ID: {fr.id}")
+                print(f"  Owner: {user_email}")
+                print(f"  Current Run Status: {fr.status}")
+                print(f"  External Action: {primary_action.operation} (ID: {primary_action.id})")
+                print(f"  Provider Action ID: {primary_action.provider_action_id}")
+                print(f"  Diagnostic: {reason}")
+                print(f"  Proposed Action: Reconcile run status -> '{AgentRunStatus.COMPLETED}' (preserve audit history)")
+
+        print("\n--- Summary ---")
+        print(f"Inconsistent awaiting_approval runs found: {len(runs_to_reconcile)}")
+        print(f"Inconsistent schedules found: {len(schedules_to_reconcile)}")
+        print(f"Dispatched runs with post-send failure found: {len(dispatched_runs_to_reconcile)}")
+
+        if not runs_to_reconcile and not schedules_to_reconcile and not dispatched_runs_to_reconcile:
             print("Database is consistent. No reconciliation needed.")
             return
 
@@ -115,6 +157,43 @@ async def reconcile(apply_changes: bool = False) -> None:
                 s.is_active = False
                 s.updated_at = now_utc
                 print(f"Applied fix to schedule {s.id}: is_active -> False")
+
+            for fr, ea, reason in dispatched_runs_to_reconcile:
+                # 1. Record an audit event preserving historical failure and reconciliation details
+                audit_event = AgentEvent(
+                    run_id=fr.id,
+                    agent_name="reconciliation",
+                    event_type="run_reconciled",
+                    event_payload={
+                        "previous_status": AgentRunStatus.FAILED,
+                        "reconciled_status": AgentRunStatus.COMPLETED,
+                        "discrepancy": reason,
+                        "operation": ea.operation,
+                        "provider_action_id": ea.provider_action_id,
+                        "original_error_message": fr.error_message,
+                    },
+                    timestamp=now_utc,
+                )
+                session.add(audit_event)
+
+                # 2. Update run to accurately reflect external dispatch completion
+                fr.status = AgentRunStatus.COMPLETED
+                current_final = fr.final_result if isinstance(fr.final_result, dict) else {}
+                current_final["reconciled"] = True
+                current_final["reconciliation_note"] = (
+                    "Reconciled: Email was successfully accepted by Gmail API before internal verification failure."
+                )
+                current_final["original_verification_critique"] = fr.error_message
+                current_final["delivery_status"] = "api_accepted"
+                current_final["message_id"] = ea.provider_action_id
+                current_final["status"] = "completed"
+                current_final["summary"] = (
+                    f"Workflow completed. Email dispatched and accepted by Gmail API "
+                    f"(Message ID: {ea.provider_action_id})."
+                )
+                fr.final_result = current_final
+                fr.error_message = None
+                print(f"Applied reconciliation to run {fr.id}: status -> {fr.status} (Message ID: {ea.provider_action_id})")
 
             await session.commit()
             print("Successfully committed reconciliation changes to database.")

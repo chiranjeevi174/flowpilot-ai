@@ -23,6 +23,12 @@ import { toast } from "sonner";
 
 import { api } from "@/lib/api/client";
 import type { IntegrationConnection } from "@/types";
+import {
+  findServiceConnection,
+  resolveServiceStatus,
+  invalidateAllIntegrationQueries,
+} from "@/lib/integrations-status";
+import { IntegrationStatusBadge } from "@/components/shared/integration-status-badge";
 import { getDeliveryStatusMeta } from "@/lib/delivery-status";
 import { PageHeader } from "@/components/shared/page-header";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "@/components/ui/card";
@@ -53,8 +59,8 @@ function IntegrationsPageContent() {
       toast.success(`Successfully connected ${provider.toUpperCase()}`, {
         description: "Your credentials have been securely stored with AES-256-GCM encryption.",
       });
-      // Invalidate queries to pick up the new connection
-      queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      // Synchronize all integration query caches
+      invalidateAllIntegrationQueries(queryClient);
     }
   }, [searchParams, queryClient]);
 
@@ -96,12 +102,13 @@ function IntegrationsPageContent() {
       toast.success("Connection test passed", {
         description: data.message || `Provider ${data.provider} verified successfully.`,
       });
-      queryClient.invalidateQueries({ queryKey: ["integrations", "connections"] });
+      invalidateAllIntegrationQueries(queryClient);
     },
     onError: (err: any) => {
       toast.error("Connection test failed", {
         description: err.message || "Failed to reach external API.",
       });
+      invalidateAllIntegrationQueries(queryClient);
     },
   });
 
@@ -117,12 +124,13 @@ function IntegrationsPageContent() {
           description: data.message || "Unable to reach Meta Cloud API with configured credentials.",
         });
       }
-      queryClient.invalidateQueries({ queryKey: ["integrations", "whatsapp-status"] });
+      invalidateAllIntegrationQueries(queryClient);
     },
     onError: (err: any) => {
       toast.error("WhatsApp connection test failed", {
         description: err.message || "Failed to reach Meta Cloud API.",
       });
+      invalidateAllIntegrationQueries(queryClient);
     },
   });
 
@@ -133,8 +141,7 @@ function IntegrationsPageContent() {
         description: "Access tokens and refresh tokens have been removed.",
       });
       setDisconnectTarget(null);
-      queryClient.invalidateQueries({ queryKey: ["integrations", "connections"] });
-      queryClient.invalidateQueries({ queryKey: ["monitoring", "health"] });
+      invalidateAllIntegrationQueries(queryClient);
     },
     onError: (err: any) => {
       toast.error("Failed to disconnect", {
@@ -159,13 +166,10 @@ function IntegrationsPageContent() {
     }
   };
 
-  // Find connection for a given provider
+  // Find connection for a given provider/service using unified resolution contract
   const findConnection = (providerId: string, service?: string) => {
-    return connections.find(
-      (c) => c.provider.toLowerCase() === providerId.toLowerCase() && (!service || c.service === service)
-    );
+    return findServiceConnection(connections, providerId, service);
   };
-
 
   return (
     <div className="space-y-8">
@@ -178,7 +182,7 @@ function IntegrationsPageContent() {
           size="sm"
           onClick={() => {
             refetch();
-            queryClient.invalidateQueries({ queryKey: ["integrations", "whatsapp-status"] });
+            invalidateAllIntegrationQueries(queryClient);
           }}
           disabled={isRefetching}
         >
@@ -226,27 +230,35 @@ function IntegrationsPageContent() {
             {/* Google / Gmail */}
             {(() => {
               const googleProv = providers.find((p) => p.id === "google");
-              const gmailConn = findConnection("google", "gmail") || findConnection("google");
+              const gmailConn = findConnection("google", "gmail");
               const isConfigured = googleProv ? googleProv.is_configured : true;
+              const gmailStatus = resolveServiceStatus(gmailConn, isConfigured, "gmail");
+              const isGmailReady = gmailStatus.isConnected;
 
               return (
-                <Card className="flex flex-col justify-between transition hover:shadow-md border-border">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <div className="p-2.5 rounded-xl bg-red-500/10 border border-red-500/20">
-                        <Mail className="h-6 w-6 text-red-500" />
+                <Card className="flex flex-col justify-between transition hover:shadow-md border-border bg-card">
+                  <CardHeader className="pb-3.5 space-y-3">
+                    <div className="flex items-center justify-between gap-2.5 min-w-0">
+                      <div className="p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 shrink-0 flex items-center justify-center">
+                        <Mail className="h-5 w-5 text-red-500" />
                       </div>
-                      <Badge
-                        variant={gmailConn ? "success" : "secondary"}
-                        className="text-xs"
-                      >
-                        {gmailConn ? "Connected" : "Not Connected"}
-                      </Badge>
+                      <div className="shrink-0 flex items-center justify-end">
+                        <IntegrationStatusBadge
+                          status={gmailStatus.statusKey}
+                          isVerifying={
+                            testMutation.isPending && (testMutation.variables as any) === gmailConn?.id
+                          }
+                        />
+                      </div>
                     </div>
-                    <CardTitle className="text-base font-semibold mt-3">Google (Gmail)</CardTitle>
-                    <CardDescription className="text-xs">
-                      Send operational emails, trigger notifications, and dispatch workflow reports.
-                    </CardDescription>
+                    <div className="space-y-1 min-w-0">
+                      <CardTitle className="text-base font-semibold text-foreground tracking-tight truncate">
+                        Google (Gmail)
+                      </CardTitle>
+                      <CardDescription className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
+                        Send operational emails, trigger notifications, and dispatch workflow reports.
+                      </CardDescription>
+                    </div>
                   </CardHeader>
 
                   <CardContent className="space-y-3 pb-3 text-xs flex-1">
@@ -254,6 +266,15 @@ function IntegrationsPageContent() {
                       <div className="flex items-start gap-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400">
                         <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
                         <span>OAuth Client ID not set in backend .env (GOOGLE_CLIENT_ID).</span>
+                      </div>
+                    )}
+
+                    {gmailConn && !isGmailReady && (
+                      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400">
+                        <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                        <span>
+                          Gmail sending permission missing (gmail.send). Reauthorization required before workflows can send emails.
+                        </span>
                       </div>
                     )}
 
@@ -267,8 +288,16 @@ function IntegrationsPageContent() {
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-muted-foreground">Status:</span>
-                          <span className="capitalize text-emerald-600 font-medium">
-                            {gmailConn.status}
+                          <span
+                            className={`capitalize font-medium ${
+                              isGmailReady
+                                ? "text-emerald-600"
+                                : gmailStatus.statusKey === "authorization_required"
+                                ? "text-blue-600"
+                                : "text-amber-600"
+                            }`}
+                          >
+                            {gmailStatus.label}
                           </span>
                         </div>
                         {gmailConn.last_verified_at && (
@@ -302,29 +331,50 @@ function IntegrationsPageContent() {
                     )}
                   </CardContent>
 
-                  <CardFooter className="pt-3 border-t border-border bg-muted/20 flex items-center justify-between">
+                  <CardFooter className="pt-3 border-t border-border bg-muted/20 flex items-center justify-between gap-2">
                     {gmailConn ? (
-                      <>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="text-xs h-8"
-                          onClick={() => testMutation.mutate(gmailConn.id)}
-                          disabled={testMutation.isPending}
-                        >
-                          <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                          Test
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-xs h-8 text-rose-600 hover:text-rose-700 hover:bg-rose-500/10"
-                          onClick={() => setDisconnectTarget(gmailConn)}
-                        >
-                          <Unplug className="h-3.5 w-3.5 mr-1" />
-                          Disconnect
-                        </Button>
-                      </>
+                      isGmailReady ? (
+                        <>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-xs h-8"
+                            onClick={() => testMutation.mutate(gmailConn.id)}
+                            disabled={testMutation.isPending}
+                          >
+                            <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                            Test
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-xs h-8 text-rose-600 hover:text-rose-700 hover:bg-rose-500/10"
+                            onClick={() => setDisconnectTarget(gmailConn)}
+                          >
+                            <Unplug className="h-3.5 w-3.5 mr-1" />
+                            Disconnect
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <Button
+                            size="sm"
+                            className="w-full text-xs"
+                            onClick={() => handleConnect("google", "gmail")}
+                            disabled={!isConfigured}
+                          >
+                            Grant Gmail Permission
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-xs h-8 text-rose-600 hover:text-rose-700 hover:bg-rose-500/10"
+                            onClick={() => setDisconnectTarget(gmailConn)}
+                          >
+                            <Unplug className="h-3.5 w-3.5" />
+                          </Button>
+                        </>
+                      )
                     ) : (
                       <Button
                         size="sm"
@@ -345,25 +395,33 @@ function IntegrationsPageContent() {
               const googleProv = providers.find((p) => p.id === "google");
               const sheetsConn = findConnection("google", "sheets");
               const isConfigured = googleProv ? googleProv.is_configured : true;
+              const sheetsStatus = resolveServiceStatus(sheetsConn, isConfigured, "sheets");
+              const isSheetsReady = sheetsStatus.isConnected;
 
               return (
-                <Card className="flex flex-col justify-between transition hover:shadow-md border-border">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-                        <FileSpreadsheet className="h-6 w-6 text-emerald-500" />
+                <Card className="flex flex-col justify-between transition hover:shadow-md border-border bg-card">
+                  <CardHeader className="pb-3.5 space-y-3">
+                    <div className="flex items-center justify-between gap-2.5 min-w-0">
+                      <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 shrink-0 flex items-center justify-center">
+                        <FileSpreadsheet className="h-5 w-5 text-emerald-500" />
                       </div>
-                      <Badge
-                        variant={sheetsConn ? "success" : "secondary"}
-                        className="text-xs"
-                      >
-                        {sheetsConn ? "Connected" : "Not Connected"}
-                      </Badge>
+                      <div className="shrink-0 flex items-center justify-end">
+                        <IntegrationStatusBadge
+                          status={sheetsStatus.statusKey}
+                          isVerifying={
+                            testMutation.isPending && (testMutation.variables as any) === sheetsConn?.id
+                          }
+                        />
+                      </div>
                     </div>
-                    <CardTitle className="text-base font-semibold mt-3">Google Sheets</CardTitle>
-                    <CardDescription className="text-xs">
-                      Read lead lists, append pipeline metrics, and update spreadsheets automatically.
-                    </CardDescription>
+                    <div className="space-y-1 min-w-0">
+                      <CardTitle className="text-base font-semibold text-foreground tracking-tight truncate">
+                        Google Sheets
+                      </CardTitle>
+                      <CardDescription className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
+                        Read lead lists, append pipeline metrics, and update spreadsheets automatically.
+                      </CardDescription>
+                    </div>
                   </CardHeader>
 
                   <CardContent className="space-y-3 pb-3 text-xs flex-1">
@@ -384,8 +442,16 @@ function IntegrationsPageContent() {
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-muted-foreground">Status:</span>
-                          <span className="capitalize text-emerald-600 font-medium">
-                            {sheetsConn.status}
+                          <span
+                            className={`capitalize font-medium ${
+                              isSheetsReady
+                                ? "text-emerald-600"
+                                : sheetsStatus.statusKey === "authorization_required"
+                                ? "text-blue-600"
+                                : "text-amber-600"
+                            }`}
+                          >
+                            {sheetsStatus.label}
                           </span>
                         </div>
                         {sheetsConn.last_verified_at && (
@@ -394,6 +460,18 @@ function IntegrationsPageContent() {
                             <span>{formatDate(sheetsConn.last_verified_at)}</span>
                           </div>
                         )}
+                        <div className="pt-1">
+                          <span className="text-[11px] text-muted-foreground block mb-1">
+                            Granted Scopes:
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {sheetsConn.granted_scopes.map((s) => (
+                              <Badge key={s} variant="outline" className="text-[10px] font-mono">
+                                {s.split("/").pop()}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div className="text-muted-foreground space-y-1">
@@ -452,23 +530,29 @@ function IntegrationsPageContent() {
               const isConfigured = slackProv ? slackProv.is_configured : true;
 
               return (
-                <Card className="flex flex-col justify-between transition hover:shadow-md border-border">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20">
-                        <MessageSquare className="h-6 w-6 text-amber-500" />
+                <Card className="flex flex-col justify-between transition hover:shadow-md border-border bg-card">
+                  <CardHeader className="pb-3.5 space-y-3">
+                    <div className="flex items-center justify-between gap-2.5 min-w-0">
+                      <div className="p-2.5 rounded-xl bg-purple-500/10 border border-purple-500/20 shrink-0 flex items-center justify-center">
+                        <MessageSquare className="h-5 w-5 text-purple-600" />
                       </div>
-                      <Badge
-                        variant={slackConn ? "success" : "secondary"}
-                        className="text-xs"
-                      >
-                        {slackConn ? "Connected" : "Not Connected"}
-                      </Badge>
+                      <div className="shrink-0 flex items-center justify-end">
+                        <IntegrationStatusBadge
+                          status={slackConn?.status || "not_configured"}
+                          isVerifying={
+                            testMutation.isPending && (testMutation.variables as any) === slackConn?.id
+                          }
+                        />
+                      </div>
                     </div>
-                    <CardTitle className="text-base font-semibold mt-3">Slack</CardTitle>
-                    <CardDescription className="text-xs">
-                      Publish operational alerts, post execution briefs, and notify team channels.
-                    </CardDescription>
+                    <div className="space-y-1 min-w-0">
+                      <CardTitle className="text-base font-semibold text-foreground tracking-tight truncate">
+                        Slack
+                      </CardTitle>
+                      <CardDescription className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
+                        Publish operational alerts, post execution briefs, and notify team channels.
+                      </CardDescription>
+                    </div>
                   </CardHeader>
 
                   <CardContent className="space-y-3 pb-3 text-xs flex-1">
@@ -499,6 +583,18 @@ function IntegrationsPageContent() {
                             <span>{formatDate(slackConn.last_verified_at)}</span>
                           </div>
                         )}
+                        <div className="pt-1">
+                          <span className="text-[11px] text-muted-foreground block mb-1">
+                            Granted Scopes:
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {slackConn.granted_scopes.map((s) => (
+                              <Badge key={s} variant="outline" className="text-[10px] font-mono">
+                                {s}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div className="text-muted-foreground space-y-1">
@@ -552,38 +648,46 @@ function IntegrationsPageContent() {
 
             {/* WhatsApp Business (Cloud API) */}
             {(() => {
-              const isConfigured = whatsappStatus?.is_configured || false;
+              const whatsappConn = findConnection("whatsapp", "whatsapp");
+              const isDeploymentConfigured = whatsappStatus?.is_configured || false;
+              // User connection state is source of truth; if no user connection, status is not_configured
+              const status = whatsappConn ? whatsappConn.status : "not_configured";
 
               return (
-                <Card className="flex flex-col justify-between transition hover:shadow-md border-border">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-[#25D366]">
+                <Card className="flex flex-col justify-between transition hover:shadow-md border-border bg-card">
+                  <CardHeader className="pb-3.5 space-y-3">
+                    <div className="flex items-center justify-between gap-2.5 min-w-0">
+                      <div className="p-2.5 rounded-xl bg-teal-500/10 border border-teal-500/20 text-[#25D366] shrink-0 flex items-center justify-center">
                         <svg
-                          className="h-6 w-6 fill-current"
+                          className="h-5 w-5 fill-current"
                           viewBox="0 0 24 24"
                           aria-label="WhatsApp"
                         >
                           <path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946.003-6.556 5.338-11.891 11.893-11.891 3.181.001 6.167 1.24 8.413 3.488 2.245 2.248 3.481 5.236 3.48 8.414-.003 6.557-5.338 11.892-11.893 11.892-1.99-.001-3.951-.5-5.688-1.448l-6.305 1.654zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884-.001 2.225.651 3.891 1.746 5.634l-.999 3.648 3.742-.981zm11.387-5.464c-.074-.124-.272-.198-.57-.347-.297-.149-1.758-.868-2.031-.967-.272-.099-.47-.149-.669.149-.198.297-.768.967-.941 1.165-.173.198-.347.223-.644.074-.297-.149-1.255-.462-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.297-.347.446-.521.151-.172.2-.296.3-.495.099-.198.05-.372-.025-.521-.075-.148-.669-1.611-.916-2.206-.242-.579-.487-.501-.669-.51l-.57-.01c-.198 0-.52.074-.792.372s-1.04 1.016-1.04 2.479 1.065 2.876 1.213 3.074c.149.198 2.095 3.2 5.076 4.487.709.306 1.263.489 1.694.626.712.226 1.36.194 1.872.118.571-.085 1.758-.719 2.006-1.413.248-.695.248-1.29.173-1.414z" />
                         </svg>
                       </div>
-                      <Badge
-                        variant={isConfigured ? "success" : "secondary"}
-                        className="text-xs"
-                      >
-                        {isConfigured ? "Configured" : "Not Configured"}
-                      </Badge>
+                      <div className="shrink-0 flex items-center justify-end">
+                        <IntegrationStatusBadge
+                          status={status}
+                          isVerifying={
+                            (testMutation.isPending && (testMutation.variables as any) === whatsappConn?.id) ||
+                            testWhatsAppMutation.isPending
+                          }
+                        />
+                      </div>
                     </div>
-                    <CardTitle className="text-base font-semibold mt-3">
-                      WhatsApp Business
-                    </CardTitle>
-                    <CardDescription className="text-xs">
-                      Official Meta Cloud API for automated notifications and pre-approved template dispatches.
-                    </CardDescription>
+                    <div className="space-y-1 min-w-0">
+                      <CardTitle className="text-base font-semibold text-foreground tracking-tight truncate">
+                        WhatsApp Business
+                      </CardTitle>
+                      <CardDescription className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
+                        Official Meta Cloud API for automated notifications and pre-approved template dispatches.
+                      </CardDescription>
+                    </div>
                   </CardHeader>
 
                   <CardContent className="space-y-3 pb-3 text-xs flex-1">
-                    {!isConfigured && (
+                    {!isDeploymentConfigured && !whatsappConn && (
                       <div className="flex flex-col gap-1.5 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400">
                         <div className="flex items-center gap-1.5 font-semibold text-[11px]">
                           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
@@ -609,7 +713,36 @@ function IntegrationsPageContent() {
                       </div>
                     )}
 
-                    {isConfigured ? (
+                    {whatsappConn ? (
+                      <div className="space-y-2 bg-muted/40 p-3 rounded-lg border border-border">
+                        <div className="flex items-center justify-between">
+                          <span className="text-muted-foreground">Phone Number / Account:</span>
+                          <span className="font-mono font-medium text-foreground">
+                            {whatsappConn.external_account_name || whatsappConn.external_account_id || "WhatsApp Account"}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-muted-foreground">Status:</span>
+                          <span className={`capitalize font-medium ${
+                            whatsappConn.status === "active" ? "text-emerald-600" : "text-red-600"
+                          }`}>
+                            {whatsappConn.status}
+                          </span>
+                        </div>
+                        {whatsappConn.last_verified_at && (
+                          <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                            <span>Last verified:</span>
+                            <span>{formatDate(whatsappConn.last_verified_at)}</span>
+                          </div>
+                        )}
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-muted-foreground">Configuration:</span>
+                          <span className="text-teal-600 dark:text-teal-400 font-medium">
+                            User Custom Credentials
+                          </span>
+                        </div>
+                      </div>
+                    ) : isDeploymentConfigured ? (
                       <div className="space-y-2 bg-muted/40 p-3 rounded-lg border border-border">
                         <div className="flex items-center justify-between">
                           <span className="text-muted-foreground">Phone Number ID:</span>
@@ -632,9 +765,9 @@ function IntegrationsPageContent() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between text-[11px]">
-                          <span className="text-muted-foreground">Connection Model:</span>
-                          <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                            Admin / Deployment
+                          <span className="text-muted-foreground">Deployment Model:</span>
+                          <span className="text-slate-600 dark:text-slate-400 font-medium">
+                            Server Deployment Available
                           </span>
                         </div>
                       </div>
@@ -652,7 +785,29 @@ function IntegrationsPageContent() {
                   </CardContent>
 
                   <CardFooter className="pt-3 border-t border-border bg-muted/20 flex items-center justify-between gap-2">
-                    {isConfigured ? (
+                    {whatsappConn ? (
+                      <>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="text-xs h-8"
+                          onClick={() => testMutation.mutate(whatsappConn.id)}
+                          disabled={testMutation.isPending}
+                        >
+                          <RefreshCw className={`h-3.5 w-3.5 mr-1 ${testMutation.isPending ? "animate-spin" : ""}`} />
+                          Test
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs h-8 text-rose-600 hover:text-rose-700 hover:bg-rose-500/10"
+                          onClick={() => setDisconnectTarget(whatsappConn)}
+                        >
+                          <Unplug className="h-3.5 w-3.5 mr-1" />
+                          Disconnect
+                        </Button>
+                      </>
+                    ) : isDeploymentConfigured ? (
                       <>
                         <Button
                           variant="outline"

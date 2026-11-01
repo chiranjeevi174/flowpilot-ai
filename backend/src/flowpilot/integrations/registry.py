@@ -106,8 +106,18 @@ async def find_user_connection(
             "Please connect it in App Connections."
         )
 
-    # Prefer connection matching service if specified
+    # Prefer connection matching service and scopes if specified
     if service:
+        scope_kw = (
+            "gmail"
+            if service in ("gmail", "mail")
+            else "spreadsheets"
+            if service in ("sheets", "spreadsheets")
+            else service
+        )
+        for r in results:
+            if any(scope_kw in s.lower() for s in (r.granted_scopes or [])):
+                return r
         for r in results:
             if r.service == service:
                 return r
@@ -359,7 +369,13 @@ async def execute_gmail_send_email(
             in_reply_to=parameters.get("in_reply_to"),
             references=parameters.get("references"),
         )
-        return res.get("message_id"), res
+        res_data = dict(res)
+        res_data["delivery_status"] = "api_accepted"
+        res_data["delivery_note"] = (
+            "Message accepted by Gmail API for dispatch. "
+            "Recipient delivery is processed asynchronously by mail transfer agents."
+        )
+        return res.get("message_id"), res_data
 
     return await _execute_with_action_audit(
         db=db,
@@ -463,15 +479,56 @@ async def execute_sheets_read_range(
 ) -> dict[str, Any]:
     """Capability: sheets_read_range."""
     conn = await find_user_connection(db, user_id, "google", "sheets")
-    spreadsheet_id = parameters.get("spreadsheet_id")
-    range_name = parameters.get("range") or parameters.get("range_name")
-    if not spreadsheet_id or not range_name:
-        raise ValueError("Parameters 'spreadsheet_id' and 'range' are required.")
+
+    # Resolve spreadsheet_id from explicit ID, URL, or spreadsheet name
+    raw_id = (
+        parameters.get("spreadsheet_id")
+        or parameters.get("spreadsheet_url")
+        or parameters.get("url")
+    )
+    raw_name = (
+        parameters.get("spreadsheet_name")
+        or parameters.get("name")
+        or parameters.get("spreadsheet")
+        or parameters.get("title")
+    )
+
+    resolved_id: str | None = None
+
+    # 1. Test if raw_id is a valid direct ID or full Google Sheets URL
+    if raw_id:
+        resolved_id = GoogleSheetsClient.extract_spreadsheet_id(str(raw_id))
+
+    # 2. Test if raw_name contains a direct ID or full Google Sheets URL
+    if not resolved_id and raw_name:
+        resolved_id = GoogleSheetsClient.extract_spreadsheet_id(str(raw_name))
+
+    # 3. If not an extracted ID/URL, search by spreadsheet name via Drive API
+    if not resolved_id:
+        target_name = str(raw_name or raw_id or "").strip()
+        if target_name:
+            resolved_id = await GoogleSheetsClient.find_spreadsheet_by_name(
+                db=db,
+                connection=conn,
+                name=target_name,
+            )
+        else:
+            raise ValueError(
+                "Parameters 'spreadsheet_id' or 'spreadsheet_name' are required "
+                "to read a spreadsheet."
+            )
+
+    range_name = (
+        parameters.get("range")
+        or parameters.get("range_name")
+        or parameters.get("worksheet")
+        or "all_sheets"
+    )
 
     res = await GoogleSheetsClient.read_range(
         db,
         conn,
-        spreadsheet_id=str(spreadsheet_id),
+        spreadsheet_id=resolved_id,
         range_name=str(range_name),
     )
     return {

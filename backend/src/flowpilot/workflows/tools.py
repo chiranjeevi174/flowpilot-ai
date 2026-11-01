@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from flowpilot.agents.events import extract_json_payload
 from flowpilot.core.logging import get_logger
 from flowpilot.llm.gateway import gateway
 from flowpilot.llm.providers import LLMMessage
@@ -198,6 +199,14 @@ async def execute_response_drafting(
         f"Tone: {tone}\n"
         f"Key points to cover: {json.dumps(key_points)}\n"
         "Return strictly valid JSON with keys: 'subject', 'body', 'suggested_action_items'.\n\n"
+        "CRITICAL ANALYSIS & EMAIL GUIDELINES:\n"
+        "1. Explain what dataset represents, its columns, and actual records analyzed.\n"
+        "2. Ground numbers in verified figures from context. Do NOT do mental arithmetic.\n"
+        "3. Explicitly state assumptions (Cost as unit price vs total order cost).\n"
+        "4. Note data quality findings (completeness, missing values, lack of currency).\n"
+        "5. Do NOT add dollar signs ($) or currency symbols if currency is unspecified.\n"
+        "6. Do NOT describe January 2026 as 'recent' without establishing a reference date.\n"
+        "7. Provide a concise, professional conclusion.\n\n"
         f"Context:\n---\n{context}\n---"
     )
 
@@ -215,13 +224,30 @@ async def execute_response_drafting(
         messages=messages,
         provider=provider,
         model=model,
-        temperature=0.3,
+        temperature=0.2,
     )
 
     try:
-        parsed = json.loads(result.content.strip())
+        parsed = extract_json_payload(result.content)
     except Exception:
         parsed = {"subject": "Customer Communication", "body": result.content}
+
+    # Ensure body is rectified against known numerical errors and contradictions
+    if isinstance(parsed, dict) and "body" in parsed and isinstance(parsed["body"], str):
+        from flowpilot.agents.analysis import TabularAnalysis, rectify_text_numbers
+
+        safety_analysis = TabularAnalysis(
+            sheet_title="Dataset",
+            total_rows_retrieved=0,
+            data_row_count=0,
+            is_truncated=False,
+            headers=[],
+            columns={},
+            currency_detected=None,
+            currency_note="",
+            date_range_note="",
+        )
+        parsed["body"] = rectify_text_numbers(parsed["body"], safety_analysis)
 
     return {
         "operation": "response_drafting",
@@ -242,16 +268,33 @@ async def execute_task_summary_generation(
     text = parameters.get("text") or parameters.get("input") or ""
     previous_results = parameters.get("previous_results")
 
-    prompt = (
-        "Generate a concise executive summary based on the following information.\n"
-        "Return strictly valid JSON with keys: 'summary', 'key_highlights', 'next_steps'.\n\n"
-        f"Source data:\n---\n{text}\n"
-        f"Prior results: {json.dumps(previous_results) if previous_results else 'None'}\n---"
-    )
+    instructions = parameters.get("instructions") or ""
+    prompt_lines = [
+        "Generate a structured executive summary based strictly on the source data below.",
+        "Return strictly valid JSON with keys: 'summary', 'key_highlights', 'next_steps'.\n",
+        "CRITICAL ANALYSIS REQUIREMENTS:",
+        "1. Explain what dataset represents, its columns, and the actual records analyzed.",
+        "2. Ground numbers in deterministic analysis provided. Do NOT compute arithmetic.",
+        "3. State assumptions: whether Cost is unit price (Units × Cost) or total order cost.",
+        "4. Note data quality findings (unspecified currency, completeness, missing values).",
+        "5. Do NOT introduce dollar signs ($) or currency symbols if unspecified in source.",
+        "6. Do NOT describe January 2026 as 'recent' without an explicit reference date.",
+        "7. Include a concise conclusion.",
+    ]
+    if instructions:
+        prompt_lines.append(f"\nSPECIFIC FORMATTING & USER INSTRUCTIONS:\n{instructions}")
+
+    prior_str = json.dumps(previous_results) if previous_results else "None"
+    prompt_lines.append(f"\nSource data:\n---\n{text}\nPrior results: {prior_str}\n---")
+    prompt = "\n".join(prompt_lines)
 
     messages = [
         LLMMessage(
-            role="system", content="You are a senior workflow analyst. Output strictly valid JSON."
+            role="system",
+            content=(
+                "You are a senior workflow analyst. Ground all observations in verified facts. "
+                "Output strictly valid JSON."
+            ),
         ),
         LLMMessage(role="user", content=prompt),
     ]
@@ -262,13 +305,58 @@ async def execute_task_summary_generation(
         messages=messages,
         provider=provider,
         model=model,
-        temperature=0.2,
+        temperature=0.1,
     )
 
     try:
-        parsed = json.loads(result.content.strip())
+        parsed = extract_json_payload(result.content)
     except Exception:
         parsed = {"summary": result.content, "key_highlights": []}
+
+    # Deterministic rectification of numbers, currency assumptions, and contradictions
+    if isinstance(parsed, dict):
+        from flowpilot.agents.analysis import TabularAnalysis, rectify_text_numbers
+
+        active_analysis = None
+        if isinstance(previous_results, list):
+            for pr in previous_results:
+                if isinstance(pr, dict):
+                    res_obj = pr.get("result") if "result" in pr else pr
+                    if (
+                        isinstance(res_obj, dict)
+                        and "rows" in res_obj
+                        and isinstance(res_obj["rows"], list)
+                        and res_obj["rows"]
+                    ):
+                        from flowpilot.agents.analysis import analyze_tabular_dataset
+
+                        active_analysis = analyze_tabular_dataset(
+                            res_obj["rows"], sheet_title=res_obj.get("range", "Dataset")
+                        )
+                        break
+
+        if active_analysis is None:
+            active_analysis = TabularAnalysis(
+                sheet_title="Dataset",
+                total_rows_retrieved=0,
+                data_row_count=0,
+                is_truncated=False,
+                headers=[],
+                columns={},
+                currency_detected=None,
+                currency_note="",
+                date_range_note="",
+            )
+
+        if "summary" in parsed and isinstance(parsed["summary"], str):
+            parsed["summary"] = rectify_text_numbers(parsed["summary"], active_analysis)
+        if "key_highlights" in parsed and isinstance(parsed["key_highlights"], list):
+            parsed["key_highlights"] = [
+                rectify_text_numbers(h, active_analysis) if isinstance(h, str) else h
+                for h in parsed["key_highlights"]
+            ]
+            # Filter out any empty lines produced by contradiction removal
+            parsed["key_highlights"] = [h for h in parsed["key_highlights"] if h and str(h).strip()]
 
     return {
         "operation": "task_summary_generation",

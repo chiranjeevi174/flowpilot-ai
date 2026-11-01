@@ -88,6 +88,34 @@ async def analyze_intent_node(
             ):
                 intent_result.is_actionable = True
 
+            # If clarification was requested solely for missing email recipient,
+            # but this is an analytical/data workflow (e.g. Google Sheets summary),
+            # recipient defaults to the authenticated user for review at the approval gate
+            if intent_result.requires_clarification and _is_supported_or_integration_intent(
+                intent_result, original_request
+            ):
+                req_lower = original_request.lower()
+                is_analysis_flow = any(
+                    k in req_lower
+                    for k in (
+                        "sheet",
+                        "spreadsheet",
+                        "data",
+                        "dataset",
+                        "summary",
+                        "report",
+                        "analyz",
+                        "calculate",
+                    )
+                )
+                msg = (intent_result.clarification_message or "").lower()
+                if is_analysis_flow and ("recipient" in msg or "email address" in msg):
+                    logger.info(
+                        "Overriding clarification: recipient defaults to user for analysis workflow"
+                    )
+                    intent_result.requires_clarification = False
+                    intent_result.clarification_message = None
+
             # Record telemetry event
             await record_event(
                 db=db,

@@ -41,8 +41,13 @@ SCOPES_GMAIL = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
+SCOPES_DRIVE_METADATA = [
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+]
+
 SCOPES_SHEETS = [
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
 
 

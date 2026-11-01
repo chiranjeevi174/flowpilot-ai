@@ -148,9 +148,61 @@ async def plan_workflow_node(
                 ):
                     step.parameters["body"] = step.parameters["content"]
 
-                # Ensure parameters contain the user's input/context if missing
-                if not step.parameters.get("text") and not step.parameters.get("context"):
-                    step.parameters["text"] = original_request
+                # Normalize Google Sheets parameter contracts
+                if op_name == "sheets_read_range":
+                    has_id_or_name = (
+                        "spreadsheet_name" in step.parameters or "spreadsheet_id" in step.parameters
+                    )
+                    if not has_id_or_name:
+                        for alias in ("name", "spreadsheet", "title"):
+                            if alias in step.parameters:
+                                step.parameters["spreadsheet_name"] = step.parameters[alias]
+                                break
+                    if "range" not in step.parameters:
+                        step.parameters["range"] = step.parameters.get("range_name") or "all_sheets"
+                    step.approval_required = False
+
+                # For downstream internal tools, bind to prior output if text/context is missing
+                from flowpilot.workflows.tools import INTERNAL_CAPABILITIES
+
+                missing_text_context = not step.parameters.get("text") and not step.parameters.get(
+                    "context"
+                )
+                if op_name in INTERNAL_CAPABILITIES and missing_text_context:
+                    if validated_steps:
+                        step.parameters["text"] = f"output_from_{validated_steps[-1].step_id}"
+                    else:
+                        step.parameters["text"] = original_request
+
+                # For downstream Gmail steps, bind body to prior output if missing
+                is_gmail_action = op_name in (
+                    "gmail_send_email",
+                    "gmail_create_draft",
+                    "gmail_prepare_response",
+                )
+                if is_gmail_action:
+                    if not step.parameters.get("body") and validated_steps:
+                        step.parameters["body"] = f"output_from_{validated_steps[-1].step_id}"
+
+                    # If an explicit email was provided in the user request, preserve it
+                    import re
+
+                    email_match = re.search(
+                        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+                        original_request,
+                    )
+                    if email_match:
+                        explicit_recip = email_match.group(0)
+                        curr_recip = str(
+                            step.parameters.get("recipient") or step.parameters.get("to") or ""
+                        ).strip()
+                        if not curr_recip or curr_recip.lower() in (
+                            "authenticated_user",
+                            "user",
+                            "me",
+                            "self",
+                        ):
+                            step.parameters["recipient"] = explicit_recip
 
                 # Enforce backend approval policy:
                 # Backend policy overrides LLM proposal: LLM cannot bypass approval requirement

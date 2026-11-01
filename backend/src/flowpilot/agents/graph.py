@@ -39,17 +39,43 @@ def route_after_approval(state: AgentState) -> Literal["executor", "__end__"]:
     return "executor"
 
 
-def route_after_executor(state: AgentState) -> Literal["verifier", "__end__"]:
+def route_after_executor(
+    state: AgentState,
+) -> Literal["approval_gate", "executor", "verifier", "__end__"]:
     """Determine routing after execution."""
-    if state.get("execution_status") == "failed":
+    if state.get("execution_status") in ("failed", "rejected"):
         return "__end__"
+
+    executed = set(state.get("executed_step_ids") or [])
+    plan = state.get("execution_plan") or []
+    unexecuted = [s for s in plan if s.get("step_id") not in executed]
+
+    if unexecuted:
+        from flowpilot.workflows.tools import is_operation_sensitive
+
+        next_step = unexecuted[0]
+        if next_step.get("approval_required") or is_operation_sensitive(
+            next_step.get("operation", ""), next_step.get("parameters")
+        ):
+            return "approval_gate"
+        return "executor"
+
     return "verifier"
 
 
 def route_after_verifier(state: AgentState) -> Literal["executor", "__end__"]:
     """Determine routing after verification (bounded correction loop)."""
     # If verifier requested correction and attempts have not been exhausted, loop back to executor
+    # ONLY if no sensitive external actions have already been dispatched.
     if state.get("execution_status") == "running":
+        step_results = state.get("step_results") or []
+        for r in step_results:
+            if (
+                r.get("operation")
+                in ("gmail_send_email", "slack_send_message", "whatsapp_send_message")
+                and r.get("status") == "success"
+            ):
+                return "__end__"
         return "executor"
     return "__end__"
 
@@ -111,6 +137,8 @@ def create_agent_graph(checkpointer: BaseCheckpointSaver | None = None) -> Compi
         "executor",
         route_after_executor,
         {
+            "approval_gate": "approval_gate",
+            "executor": "executor",
             "verifier": "verifier",
             "__end__": END,
         },

@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "FlowPilot AI - Multi-Agent Workflow Orchestration & Business Automation Platform"
 readme = "README.md"
 authors = [
-    { name = "chiranjeevi174", email = "chiranjeevi2034@gmail.com" }
+    { name = "chiranjeevi174", email = "180376479+chiranjeevi174@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
